@@ -165,22 +165,3 @@ Hazelcast and queue settings are read from Consul KV:
 |---|---|
 | `config/hazelcast/cluster_members` | `hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701` |
 | `config/message_queue/counter_queue_name` | `counter-transactions` |
-
-## Git branch
-
-The required branch for this lab is:
-
-```bash
-git checkout -b micro_consul
-```
-
-## Performance testing table template
-
-| Test scenario | Task 1 (in-mem) | Task 3 (DB) | Task 5 (final) |
-|---|---:|---:|---:|
-| 10 accounts — Total time |  |  |  |
-| 10 accounts — logging-service contribution |  |  |  |
-| 10 accounts — counter-service contribution |  |  |  |
-| 1 account — Total time |  |  |  |
-| 1 account — logging-service contribution |  |  |  |
-| 1 account — counter-service contribution |  |  |  |
