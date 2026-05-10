@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import asyncio
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -21,7 +22,15 @@ db_pool: asyncpg.Pool | None = None
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    for attempt in range(1, 11):
+        try:
+            db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+            break
+        except OSError as exc:
+            if attempt == 10:
+                raise
+            print(f"counter-service waiting for PostgreSQL ({attempt}/10): {exc}")
+            await asyncio.sleep(2)
     async with db_pool.acquire() as conn:
         await conn.execute(
             """
@@ -42,7 +51,11 @@ app = FastAPI(title="counter-service", lifespan=lifespan)
 
 @app.get("/message", response_class=PlainTextResponse)
 async def get_message() -> PlainTextResponse:
-    return PlainTextResponse(content=STATIC_MESSAGE)
+    if db_pool is None:
+        raise HTTPException(status_code=500, detail="database not initialized")
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT value FROM counter_messages ORDER BY id")
+    return PlainTextResponse(content="\n".join(r["value"] for r in rows))
 
 
 @app.post("/counter")

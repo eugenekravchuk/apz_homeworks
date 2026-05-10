@@ -84,8 +84,8 @@ async def post_message(payload: MessageIn) -> dict[str, Any]:
     if not payload.msg:
         raise HTTPException(status_code=400, detail="msg is required")
 
-    if not grpc_stubs:
-        raise HTTPException(status_code=500, detail="gRPC clients not initialized")
+    if not grpc_stubs or http_client is None:
+        raise HTTPException(status_code=500, detail="clients not initialized")
 
     message_id = str(uuid.uuid4())
 
@@ -95,10 +95,16 @@ async def post_message(payload: MessageIn) -> dict[str, Any]:
                 logging_pb2.LogRequest(id=message_id, message=payload.msg), timeout=2.0
             )
         )
+        counter_resp = await http_client.post(
+            f"{COUNTER_SERVICE_URL}/counter",
+            json={"value": payload.msg},
+            timeout=2.0,
+        )
+        counter_resp.raise_for_status()
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"all logging-service instances failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"message forwarding failed: {exc}") from exc
 
-    return {"id": message_id, "message": payload.msg, "status": "forwarded to logging-service (gRPC)"}
+    return {"id": message_id, "message": payload.msg, "status": "forwarded to logging-service and counter-service"}
 
 
 @app.get("/api/messages", response_class=PlainTextResponse)
@@ -110,13 +116,14 @@ async def get_messages() -> PlainTextResponse:
         logs_resp = await call_logging_with_fallback(
             lambda stub: stub.GetLogs(logging_pb2.GetLogsRequest(), timeout=2.0)
         )
-        counter_resp = await http_client.get(f"{COUNTER_SERVICE_URL}/message", timeout=2.0)
+        counter_resp = await http_client.get(f"{COUNTER_SERVICE_URL}/counter", timeout=2.0)
         counter_resp.raise_for_status()
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"failed to gather responses: {exc}") from exc
 
-    combined_logs = "\n".join(logs_resp.messages)
-    combined = f"{combined_logs}\n{counter_resp.text}" if combined_logs else counter_resp.text
+    counter_data = counter_resp.json()
+    counter_messages = [item["value"] for item in counter_data.get("messages", [])]
+    combined = "\n".join(list(logs_resp.messages) + counter_messages)
     return PlainTextResponse(content=combined)
 
 
