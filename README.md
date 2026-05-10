@@ -1,7 +1,5 @@
 # Task_3-Microservices_with_Hazelcast
 
-Extends Task 1: logging-service now uses a **Hazelcast Distributed IMap** for shared storage across 3 instances. counter-service (formerly messages-service) uses **PostgreSQL** as persistent storage. facade-service randomly picks a logging-service instance with fallback and also writes each message to counter-service.
-
 ## Architecture
 - **facade-service** (port 3000) — HTTP entry point; randomly selects one of 3 logging-service instances per request, falls back on failure, and forwards messages to counter-service
 - **logging-service** ×3 (ports 4001/4002/4003 HTTP, 50051/50052/50053 gRPC) — each connects to its own Hazelcast node but shares the same distributed `messages` IMap
