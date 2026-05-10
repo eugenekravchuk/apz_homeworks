@@ -160,11 +160,3 @@ curl http://localhost:3000/api/messages
 | `COUNTER_PORT` | `5000` | counter-service |
 | `SERVICE_ADDRESS` | `localhost:5000` | counter-service registry address |
 | `DATABASE_URL` | `postgresql://counter:counter@localhost:5432/counter` | counter-service |
-
-## Git branch
-
-The required branch for this lab is:
-
-```bash
-git checkout -b micro_mq
-```
