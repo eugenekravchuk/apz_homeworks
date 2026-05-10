@@ -1,5 +1,0 @@
-fastapi==0.110.0
-uvicorn==0.29.0
-grpcio==1.66.1
-grpcio-tools==1.66.1
-protobuf==5.26.1

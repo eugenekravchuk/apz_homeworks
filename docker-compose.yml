@@ -1,0 +1,39 @@
+services:
+  hz1:
+    image: hazelcast/hazelcast:5.3
+    container_name: hz1
+    hostname: hz1
+    ports: ["5701:5701"]
+    environment:
+      - JAVA_OPTS=-Dhazelcast.config=/opt/hazelcast/config/hazelcast.yaml
+    volumes:
+      - ./hazelcast.yaml:/opt/hazelcast/config/hazelcast.yaml:ro
+  hz2:
+    image: hazelcast/hazelcast:5.3
+    container_name: hz2
+    hostname: hz2
+    ports: ["5702:5701"]
+    environment:
+      - JAVA_OPTS=-Dhazelcast.config=/opt/hazelcast/config/hazelcast.yaml
+    volumes:
+      - ./hazelcast.yaml:/opt/hazelcast/config/hazelcast.yaml:ro
+  hz3:
+    image: hazelcast/hazelcast:5.3
+    container_name: hz3
+    hostname: hz3
+    ports: ["5703:5701"]
+    environment:
+      - JAVA_OPTS=-Dhazelcast.config=/opt/hazelcast/config/hazelcast.yaml
+    volumes:
+      - ./hazelcast.yaml:/opt/hazelcast/config/hazelcast.yaml:ro
+  mancenter:
+    image: hazelcast/management-center:5.3
+    container_name: mancenter
+    ports: ["8080:8080"]
+    environment:
+      - MC_DEFAULT_CLUSTER=apz-hz
+      - MC_DEFAULT_CLUSTER_MEMBERS=hz1:5701,hz2:5701,hz3:5701
+    depends_on:
+      - hz1
+      - hz2
+      - hz3
