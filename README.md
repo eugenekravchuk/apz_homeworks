@@ -1,4 +1,4 @@
-# APZ Microservices
+# Lab 5 - Microservices with Consul
 
 Microservice application with `facade-service`, `logging-service`, `counter-service`, Consul, Hazelcast, and PostgreSQL.
 
