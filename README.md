@@ -1,12 +1,12 @@
 # Task_3-Microservices_with_Hazelcast
 
-Extends Task 1: logging-service now uses a **Hazelcast Distributed IMap** for shared storage across 3 instances. counter-service (formerly messages-service) uses **PostgreSQL**. facade-service randomly picks a logging-service instance and falls back to the next one if unavailable.
+Extends Task 1: logging-service now uses a **Hazelcast Distributed IMap** for shared storage across 3 instances. counter-service (formerly messages-service) uses **PostgreSQL** as persistent storage. facade-service randomly picks a logging-service instance with fallback and also writes each message to counter-service.
 
 ## Architecture
-- **facade-service** (port 3000) — HTTP entry point; randomly selects one of 3 logging-service instances per request, falls back on failure
+- **facade-service** (port 3000) — HTTP entry point; randomly selects one of 3 logging-service instances per request, falls back on failure, and forwards messages to counter-service
 - **logging-service** ×3 (ports 4001/4002/4003 HTTP, 50051/50052/50053 gRPC) — each connects to its own Hazelcast node but shares the same distributed `messages` IMap
 - **Hazelcast cluster** ×3 nodes (ports 5701/5702/5703) — data is replicated/partitioned across all nodes
-- **counter-service** (port 5000) — static message endpoint + PostgreSQL-backed counter storage
+- **counter-service** (port 5000) — PostgreSQL-backed message/counter storage; exposes `/counter`
 - **PostgreSQL** (port 5432)
 
 ## Quick start (Docker)
@@ -16,16 +16,32 @@ docker compose up --build
 ```
 
 ## API
-### POST — store a message
+### POST — store a message through facade
 ```bash
 curl -X POST http://localhost:3000/api/messages \
   -H "Content-Type: application/json" \
   -d "{\"msg\": \"msg1\"}"
 ```
 
-### GET — read all messages
+The request is written to both:
+- Hazelcast via logging-service
+- PostgreSQL via counter-service
+
+### GET — read combined messages through facade
 ```bash
 curl http://localhost:3000/api/messages
+```
+
+The response combines data from Hazelcast and PostgreSQL. Therefore, the same submitted message can appear twice: once from logging-service and once from counter-service.
+
+### GET — read PostgreSQL-backed counter-service data directly
+```bash
+curl http://localhost:5000/counter
+```
+
+Expected response shape:
+```json
+{"messages":[{"id":1,"value":"msg1"}]}
 ```
 
 ### POST 10 messages at once (bash)
@@ -44,10 +60,29 @@ docker compose stop logging-1
 
 # POST/GET still works via logging-2 or logging-3
 curl -X POST http://localhost:3000/api/messages -H "Content-Type: application/json" -d "{\"msg\":\"test\"}"
+curl http://localhost:3000/api/messages
+curl http://localhost:5000/counter
 
-# Stop a Hazelcast node — data is preserved on remaining nodes
+# Stop a Hazelcast node — data remains available through the remaining Hazelcast nodes and PostgreSQL counter-service
 docker compose stop hazelcast-1
 curl http://localhost:3000/api/messages
+curl http://localhost:5000/counter
+```
+
+## Useful report commands
+```bash
+# Show which logging-service instance received each message
+docker compose logs logging-1 logging-2 logging-3 --since=5m | grep "Stored\|GetLogs"
+
+# Clean all containers and PostgreSQL volume
+docker compose down -v
+
+# Performance test in Git Bash
+time for i in $(seq 1 100); do
+  curl -s -X POST http://localhost:3000/api/messages \
+    -H "Content-Type: application/json" \
+    -d "{\"msg\": \"perf$i\"}" > /dev/null
+done
 ```
 
 ## Environment variables
@@ -62,8 +97,9 @@ curl http://localhost:3000/api/messages
 | `SERVICE_INSTANCE` | `logging-1` | logging (for log labels) |
 | `COUNTER_PORT` | 5000 | counter |
 | `DATABASE_URL` | `postgresql://counter:counter@localhost:5432/counter` | counter |
-| `STATIC_MESSAGE` | `not implemented yet` | counter |
+| `STATIC_MESSAGE` | unused compatibility fallback | counter |
 
 ## Notes
 - Hazelcast IMap named `messages` is shared across all logging-service instances — shutting down any instance does not lose data.
 - PostgreSQL data is persisted in a Docker volume (`postgres-data`).
+- counter-service no longer returns `not implemented yet`; `/message` and `/counter` are backed by PostgreSQL.
