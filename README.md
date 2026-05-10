@@ -1,4 +1,4 @@
-# APZ Microservices
+# Lab 4 - Microservices with Message Queue
 
 Microservice application with `facade-service`, `logging-service`, `counter-service`, `config-server`, Hazelcast, and PostgreSQL.
 
