@@ -7,6 +7,7 @@ import uuid
 import pathlib
 import socket
 import sys
+import time
 from typing import Any, Awaitable, Callable
 
 import grpc
@@ -173,18 +174,31 @@ async def post_message(payload: MessageIn) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail="clients not initialized")
 
     message_id = str(uuid.uuid4())
+    total_started = time.perf_counter()
+    logging_ms = 0.0
+    counter_queue_ms = 0.0
 
     try:
+        logging_started = time.perf_counter()
         await call_logging_with_fallback(
             lambda stub: stub.AddLog(
                 logging_pb2.LogRequest(id=message_id, message=payload.msg), timeout=2.0
             )
         )
+        logging_ms = (time.perf_counter() - logging_started) * 1000
         loop = asyncio.get_event_loop()
+        counter_queue_started = time.perf_counter()
         await loop.run_in_executor(None, hz_queue.put, {"value": payload.msg})
+        counter_queue_ms = (time.perf_counter() - counter_queue_started) * 1000
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"message forwarding failed: {exc}") from exc
 
+    total_ms = (time.perf_counter() - total_started) * 1000
+    print(
+        f"PERF POST message_id={message_id} total_ms={total_ms:.2f} "
+        f"logging_ms={logging_ms:.2f} counter_queue_ms={counter_queue_ms:.2f}",
+        flush=True,
+    )
     return {"id": message_id, "message": payload.msg, "status": "forwarded to logging-service and queued for counter-service"}
 
 
@@ -193,22 +207,37 @@ async def get_messages() -> PlainTextResponse:
     if http_client is None:
         raise HTTPException(status_code=500, detail="clients not initialized")
 
+    total_started = time.perf_counter()
+    logging_started = time.perf_counter()
     logs_resp = await call_logging_with_fallback(
         lambda stub: stub.GetLogs(logging_pb2.GetLogsRequest(), timeout=2.0)
     )
+    logging_ms = (time.perf_counter() - logging_started) * 1000
 
     try:
+        counter_started = time.perf_counter()
         counter_service_url = await pick_counter_service_url()
         counter_resp = await http_client.get(f"{counter_service_url}/counter", timeout=2.0)
         counter_resp.raise_for_status()
+        counter_ms = (time.perf_counter() - counter_started) * 1000
     except Exception as exc:  # noqa: BLE001
         print(f"counter-service unavailable while reading counters: {exc}")
         logs_only = "\n".join(list(logs_resp.messages))
+        total_ms = (time.perf_counter() - total_started) * 1000
+        print(
+            f"PERF GET total_ms={total_ms:.2f} logging_ms={logging_ms:.2f} counter_ms=unavailable",
+            flush=True,
+        )
         return PlainTextResponse(content=f"{logs_only}\nnull" if logs_only else "null")
 
     counter_data = counter_resp.json()
     counter_messages = [item["value"] for item in counter_data.get("messages", [])]
     combined = "\n".join(list(logs_resp.messages) + counter_messages)
+    total_ms = (time.perf_counter() - total_started) * 1000
+    print(
+        f"PERF GET total_ms={total_ms:.2f} logging_ms={logging_ms:.2f} counter_ms={counter_ms:.2f}",
+        flush=True,
+    )
     return PlainTextResponse(content=combined)
 
 
