@@ -59,6 +59,17 @@ services:
     networks:
       - apz-net
 
+  config-server:
+    build:
+      context: .
+      dockerfile: config-server/Dockerfile
+    environment:
+      CONFIG_PORT: "7000"
+    ports:
+      - "7000:7000"
+    networks:
+      - apz-net
+
   # ── logging-service (3 instances) ────────────────────────────────────────────
   logging-1:
     build:
@@ -69,6 +80,8 @@ services:
       LOGGING_GRPC_PORT: "50051"
       HAZELCAST_ADDR: "hazelcast-1:5701"
       SERVICE_INSTANCE: "logging-1"
+      CONFIG_SERVER_URL: "http://config-server:7000"
+      SERVICE_GRPC_ADDRESS: "logging-1:50051"
     ports:
       - "4001:4000"
       - "50051:50051"
@@ -88,6 +101,8 @@ services:
       LOGGING_GRPC_PORT: "50051"
       HAZELCAST_ADDR: "hazelcast-2:5701"
       SERVICE_INSTANCE: "logging-2"
+      CONFIG_SERVER_URL: "http://config-server:7000"
+      SERVICE_GRPC_ADDRESS: "logging-2:50051"
     ports:
       - "4002:4000"
       - "50052:50051"
@@ -107,6 +122,8 @@ services:
       LOGGING_GRPC_PORT: "50051"
       HAZELCAST_ADDR: "hazelcast-3:5701"
       SERVICE_INSTANCE: "logging-3"
+      CONFIG_SERVER_URL: "http://config-server:7000"
+      SERVICE_GRPC_ADDRESS: "logging-3:50051"
     ports:
       - "4003:4000"
       - "50053:50051"
@@ -124,11 +141,19 @@ services:
       COUNTER_PORT: "5000"
       DATABASE_URL: "postgresql://counter:counter@postgres:5432/counter"
       STATIC_MESSAGE: "not implemented yet"
+      CONFIG_SERVER_URL: "http://config-server:7000"
+      SERVICE_ADDRESS: "counter-service:5000"
+      HAZELCAST_ADDR: "hazelcast-1:5701"
+      COUNTER_QUEUE_NAME: "counter-transactions"
     ports:
       - "5000:5000"
     depends_on:
       postgres:
         condition: service_healthy
+      hazelcast-1:
+        condition: service_started
+      config-server:
+        condition: service_started
     networks:
       - apz-net
 
@@ -141,13 +166,17 @@ services:
       FACADE_PORT: "3000"
       LOGGING_GRPC_ADDRS: "logging-1:50051,logging-2:50051,logging-3:50051"
       COUNTER_SERVICE_URL: "http://counter-service:5000"
+      CONFIG_SERVER_URL: "http://config-server:7000"
+      HAZELCAST_ADDR: "hazelcast-1:5701"
+      COUNTER_QUEUE_NAME: "counter-transactions"
     ports:
       - "3000:3000"
     depends_on:
       - logging-1
       - logging-2
       - logging-3
-      - counter-service
+      - hazelcast-1
+      - config-server
     networks:
       - apz-net
 

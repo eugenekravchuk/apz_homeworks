@@ -1,105 +1,170 @@
-# Task_3-Microservices_with_Hazelcast
+# Lab 4 — Microservices with Messaging Queue
 
-Extends Task 1: logging-service now uses a **Hazelcast Distributed IMap** for shared storage across 3 instances. counter-service (formerly messages-service) uses **PostgreSQL** as persistent storage. facade-service randomly picks a logging-service instance with fallback and also writes each message to counter-service.
+The project implements asynchronous communication between `facade-service` and `counter-service` through a Hazelcast Distributed Queue. It also adds `config-server`, where services register themselves on startup and from which `facade-service` discovers service instances before making requests.
 
 ## Architecture
-- **facade-service** (port 3000) — HTTP entry point; randomly selects one of 3 logging-service instances per request, falls back on failure, and forwards messages to counter-service
-- **logging-service** ×3 (ports 4001/4002/4003 HTTP, 50051/50052/50053 gRPC) — each connects to its own Hazelcast node but shares the same distributed `messages` IMap
-- **Hazelcast cluster** ×3 nodes (ports 5701/5702/5703) — data is replicated/partitioned across all nodes
-- **counter-service** (port 5000) — PostgreSQL-backed message/counter storage; exposes `/counter`
-- **PostgreSQL** (port 5432)
 
-## Quick start (Docker)
+- **facade-service** (`localhost:3000`) — public HTTP API. POST writes to `logging-service` and puts a transaction into Hazelcast Queue for `counter-service`; GET reads logs and counters.
+- **config-server** (`localhost:7000`) — in-memory service registry with `/register`, `/services`, and `/services/{name}`.
+- **logging-service ×3** (`localhost:4001..4003`, gRPC `50051..50053`) — stores messages in Hazelcast `messages` IMap and registers gRPC addresses in `config-server`.
+- **counter-service** (`localhost:5000`) — consumes transactions from Hazelcast Queue `counter-transactions`, stores them in PostgreSQL, and exposes `/counter`.
+- **Hazelcast cluster ×3** (`localhost:5701..5703`) — distributed IMap for logs and Queue for async counter updates.
+- **PostgreSQL** (`localhost:5432`) — persistent storage for `counter-service`.
+
+## Quick start
 
 ```bash
 docker compose up --build
 ```
 
+Check registered services:
+
+```bash
+curl http://localhost:7000/services
+```
+
 ## API
-### POST — store a message through facade
+
+### POST transaction through facade-service
+
 ```bash
 curl -X POST http://localhost:3000/api/messages \
   -H "Content-Type: application/json" \
-  -d "{\"msg\": \"msg1\"}"
+  -d "{\"msg\":\"msg1\"}"
 ```
 
-The request is written to both:
-- Hazelcast via logging-service
-- PostgreSQL via counter-service
+Expected response:
 
-### GET — read combined messages through facade
-```bash
-curl http://localhost:3000/api/messages
-```
-
-The response combines data from Hazelcast and PostgreSQL. Therefore, the same submitted message can appear twice: once from logging-service and once from counter-service.
-
-### GET — read PostgreSQL-backed counter-service data directly
-```bash
-curl http://localhost:5000/counter
-```
-
-Expected response shape:
 ```json
-{"messages":[{"id":1,"value":"msg1"}]}
+{
+  "id": "...",
+  "message": "msg1",
+  "status": "forwarded to logging-service and queued for counter-service"
+}
 ```
 
-### POST 10 messages at once (bash)
+### POST 10 transactions
+
 ```bash
 for i in $(seq 1 10); do
   curl -s -X POST http://localhost:3000/api/messages \
     -H "Content-Type: application/json" \
-    -d "{\"msg\": \"msg$i\"}" | python -m json.tool
+    -d "{\"msg\":\"msg$i\"}"
+  echo
 done
 ```
 
-## Fault-tolerance testing
+### GET combined data through facade-service
+
 ```bash
-# Stop one logging instance
-docker compose stop logging-1
-
-# POST/GET still works via logging-2 or logging-3
-curl -X POST http://localhost:3000/api/messages -H "Content-Type: application/json" -d "{\"msg\":\"test\"}"
 curl http://localhost:3000/api/messages
-curl http://localhost:5000/counter
+```
 
-# Stop a Hazelcast node — data remains available through the remaining Hazelcast nodes and PostgreSQL counter-service
-docker compose stop hazelcast-1
-curl http://localhost:3000/api/messages
+The response contains messages from `logging-service` and values stored by `counter-service`. If `counter-service` is unavailable, the response ends with `null`.
+
+### GET counter-service data directly
+
+```bash
 curl http://localhost:5000/counter
+```
+
+Expected shape:
+
+```json
+{
+  "messages": [
+    {
+      "id": 1,
+      "value": "msg1"
+    }
+  ]
+}
 ```
 
 ## Useful report commands
+
+Show that different `logging-service` instances receive requests:
+
 ```bash
-# Show which logging-service instance received each message
-docker compose logs logging-1 logging-2 logging-3 --since=5m | grep "Stored\|GetLogs"
+docker compose logs logging-1 logging-2 logging-3 --since=10m | grep "Stored message"
+```
 
-# Clean all containers and PostgreSQL volume
+Show `counter-service` consuming queued transactions:
+
+```bash
+docker compose logs counter-service --since=10m | grep "consumed transaction"
+```
+
+Show service registrations:
+
+```bash
+docker compose logs config-server --since=10m
+```
+
+Clean all containers and persisted PostgreSQL data:
+
+```bash
 docker compose down -v
+```
 
-# Performance test in Git Bash
-time for i in $(seq 1 100); do
-  curl -s -X POST http://localhost:3000/api/messages \
-    -H "Content-Type: application/json" \
-    -d "{\"msg\": \"perf$i\"}" > /dev/null
-done
+## Fault-tolerance scenario
+
+Pause `counter-service`:
+
+```bash
+docker pause hw3_version2-counter-service-1
+```
+
+POST requests still succeed because `facade-service` puts transactions into Hazelcast Queue:
+
+```bash
+curl -X POST http://localhost:3000/api/messages \
+  -H "Content-Type: application/json" \
+  -d "{\"msg\":\"queued-while-counter-paused\"}"
+```
+
+GET through `facade-service` returns logs and `null` for unavailable counter data:
+
+```bash
+curl http://localhost:3000/api/messages
+```
+
+Resume `counter-service`:
+
+```bash
+docker unpause hw3_version2-counter-service-1
+```
+
+After a short delay, `counter-service` consumes accumulated queue messages:
+
+```bash
+docker compose logs counter-service --since=5m | grep "consumed transaction"
+curl http://localhost:3000/api/messages
 ```
 
 ## Environment variables
+
 | Variable | Default | Service |
 |---|---|---|
-| `FACADE_PORT` | 3000 | facade |
-| `LOGGING_GRPC_ADDRS` | `localhost:50051` | facade (comma-separated) |
-| `COUNTER_SERVICE_URL` | `http://localhost:5000` | facade |
-| `LOGGING_PORT` | 4000 | logging |
-| `LOGGING_GRPC_PORT` | 50051 | logging |
-| `HAZELCAST_ADDR` | `localhost:5701` | logging |
-| `SERVICE_INSTANCE` | `logging-1` | logging (for log labels) |
-| `COUNTER_PORT` | 5000 | counter |
-| `DATABASE_URL` | `postgresql://counter:counter@localhost:5432/counter` | counter |
-| `STATIC_MESSAGE` | unused compatibility fallback | counter |
+| `CONFIG_PORT` | `7000` | config-server |
+| `FACADE_PORT` | `3000` | facade-service |
+| `CONFIG_SERVER_URL` | `http://localhost:7000` | facade/logging/counter |
+| `LOGGING_GRPC_ADDRS` | `localhost:50051` | facade fallback |
+| `COUNTER_SERVICE_URL` | `http://localhost:5000` | facade fallback |
+| `HAZELCAST_ADDR` | `localhost:5701` | facade/logging/counter |
+| `COUNTER_QUEUE_NAME` | `counter-transactions` | facade/counter |
+| `LOGGING_PORT` | `4000` | logging-service |
+| `LOGGING_GRPC_PORT` | `50051` | logging-service |
+| `SERVICE_INSTANCE` | `logging-1` | logging-service |
+| `SERVICE_GRPC_ADDRESS` | `localhost:50051` | logging-service registry address |
+| `COUNTER_PORT` | `5000` | counter-service |
+| `SERVICE_ADDRESS` | `localhost:5000` | counter-service registry address |
+| `DATABASE_URL` | `postgresql://counter:counter@localhost:5432/counter` | counter-service |
 
-## Notes
-- Hazelcast IMap named `messages` is shared across all logging-service instances — shutting down any instance does not lose data.
-- PostgreSQL data is persisted in a Docker volume (`postgres-data`).
-- counter-service no longer returns `not implemented yet`; `/message` and `/counter` are backed by PostgreSQL.
+## Git branch
+
+The required branch for this lab is:
+
+```bash
+git checkout -b micro_mq
+```

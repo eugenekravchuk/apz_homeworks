@@ -8,6 +8,7 @@ from typing import Any
 
 import grpc
 import hazelcast
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
@@ -21,11 +22,30 @@ LOGGING_PORT = int(os.getenv("LOGGING_PORT", "4000"))
 LOGGING_GRPC_PORT = int(os.getenv("LOGGING_GRPC_PORT", "50051"))
 HAZELCAST_ADDR = os.getenv("HAZELCAST_ADDR", "localhost:5701")
 SERVICE_INSTANCE = os.getenv("SERVICE_INSTANCE", "logging-1")
+CONFIG_SERVER_URL = os.getenv("CONFIG_SERVER_URL", "http://localhost:7000")
+SERVICE_GRPC_ADDRESS = os.getenv("SERVICE_GRPC_ADDRESS", f"localhost:{LOGGING_GRPC_PORT}")
 
 app = FastAPI(title="logging-service")
 
 hz_client: hazelcast.HazelcastClient | None = None
 hz_map: Any = None
+
+
+async def register_service() -> None:
+    async with httpx.AsyncClient() as client:
+        for attempt in range(1, 11):
+            try:
+                response = await client.post(
+                    f"{CONFIG_SERVER_URL}/register",
+                    json={"name": "logging-service", "address": SERVICE_GRPC_ADDRESS},
+                    timeout=2.0,
+                )
+                response.raise_for_status()
+                print(f"[{SERVICE_INSTANCE}] registered at config-server as {SERVICE_GRPC_ADDRESS}")
+                return
+            except Exception as exc:
+                print(f"[{SERVICE_INSTANCE}] registration retry {attempt}/10: {exc}")
+                await asyncio.sleep(2)
 
 
 class LogEntry(BaseModel):
@@ -80,6 +100,7 @@ async def startup() -> None:
         raise
     app.state.grpc_server = await start_grpc_server()
     print(f"[{SERVICE_INSTANCE}] gRPC server listening on {LOGGING_GRPC_PORT}")
+    await register_service()
 
 
 @app.on_event("shutdown")
