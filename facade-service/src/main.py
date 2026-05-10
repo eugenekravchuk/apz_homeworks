@@ -5,6 +5,7 @@ import os
 import random
 import uuid
 import pathlib
+import socket
 import sys
 from typing import Any, Awaitable, Callable
 
@@ -21,15 +22,11 @@ import logging_pb2
 import logging_pb2_grpc
 
 FACADE_PORT = int(os.getenv("FACADE_PORT", "3000"))
-LOGGING_GRPC_ADDRS = [
-    addr.strip()
-    for addr in os.getenv("LOGGING_GRPC_ADDRS", "localhost:50051").split(",")
-    if addr.strip()
-]
-COUNTER_SERVICE_URL = os.getenv("COUNTER_SERVICE_URL", "http://localhost:5000")
-CONFIG_SERVER_URL = os.getenv("CONFIG_SERVER_URL", "http://localhost:7000")
-HAZELCAST_ADDR = os.getenv("HAZELCAST_ADDR", "localhost:5701")
-COUNTER_QUEUE_NAME = os.getenv("COUNTER_QUEUE_NAME", "counter-transactions")
+CONSUL_URL = os.getenv("CONSUL_URL", "http://localhost:8500")
+SERVICE_HOST = os.getenv("SERVICE_HOST", socket.gethostname())
+SERVICE_ID = os.getenv("SERVICE_ID", f"facade-service-{SERVICE_HOST}-{FACADE_PORT}")
+HAZELCAST_ADDR = "localhost:5701"
+COUNTER_QUEUE_NAME = "counter-transactions"
 
 app = FastAPI(title="facade-service")
 
@@ -42,13 +39,54 @@ class MessageIn(BaseModel):
     msg: str
 
 
+async def consul_get_kv(key: str) -> str:
+    if http_client is None:
+        raise RuntimeError("http client is not initialized")
+    response = await http_client.get(f"{CONSUL_URL}/v1/kv/{key}?raw", timeout=5.0)
+    response.raise_for_status()
+    return response.text.strip()
+
+
+async def load_runtime_config() -> None:
+    global HAZELCAST_ADDR, COUNTER_QUEUE_NAME
+    HAZELCAST_ADDR = await consul_get_kv("config/hazelcast/cluster_members")
+    COUNTER_QUEUE_NAME = await consul_get_kv("config/message_queue/counter_queue_name")
+    print(f"Loaded config from Consul: hazelcast={HAZELCAST_ADDR}, queue={COUNTER_QUEUE_NAME}")
+
+
+async def register_service() -> None:
+    if http_client is None:
+        raise RuntimeError("http client is not initialized")
+    payload = {
+        "ID": SERVICE_ID,
+        "Name": "facade-service",
+        "Address": SERVICE_HOST,
+        "Port": FACADE_PORT,
+        "Check": {
+            "HTTP": f"http://{SERVICE_HOST}:{FACADE_PORT}/health",
+            "Interval": "5s",
+            "Timeout": "2s",
+            "DeregisterCriticalServiceAfter": "30s",
+        },
+    }
+    response = await http_client.put(f"{CONSUL_URL}/v1/agent/service/register", json=payload, timeout=5.0)
+    response.raise_for_status()
+    print(f"Registered facade-service in Consul as {SERVICE_ID} at {SERVICE_HOST}:{FACADE_PORT}")
+
+
 async def discover_service(service_name: str) -> list[str]:
     if http_client is None:
         raise RuntimeError("http client is not initialized")
-    response = await http_client.get(f"{CONFIG_SERVER_URL}/services/{service_name}", timeout=2.0)
+    response = await http_client.get(f"{CONSUL_URL}/v1/health/service/{service_name}?passing=true", timeout=2.0)
     response.raise_for_status()
-    data = response.json()
-    return [addr for addr in data.get("instances", []) if addr]
+    instances = []
+    for item in response.json():
+        service = item.get("Service", {})
+        address = service.get("Address")
+        port = service.get("Port")
+        if address and port:
+            instances.append(f"{address}:{port}")
+    return instances
 
 
 async def call_logging_with_fallback(
@@ -56,7 +94,7 @@ async def call_logging_with_fallback(
 ) -> Any:
     addresses = await discover_service("logging-service")
     if not addresses:
-        addresses = LOGGING_GRPC_ADDRS
+        raise RuntimeError("no healthy logging-service instances found in Consul")
     random.shuffle(addresses)
     last_exc: Exception | None = None
     for address in addresses:
@@ -75,37 +113,55 @@ async def call_logging_with_fallback(
 async def pick_counter_service_url() -> str:
     addresses = await discover_service("counter-service")
     if not addresses:
-        return COUNTER_SERVICE_URL
-    return random.choice(addresses)
+        raise RuntimeError("no healthy counter-service instances found in Consul")
+    return f"http://{random.choice(addresses)}"
 
 
 @app.on_event("startup")
 async def startup() -> None:
     global http_client, hz_client, hz_queue
     http_client = httpx.AsyncClient()
+    for attempt in range(1, 11):
+        try:
+            await load_runtime_config()
+            await register_service()
+            break
+        except Exception as exc:
+            if attempt == 10:
+                raise
+            print(f"facade-service waiting for Consul config ({attempt}/10): {exc}")
+            await asyncio.sleep(2)
     loop = asyncio.get_event_loop()
     def init_hazelcast() -> tuple[hazelcast.HazelcastClient, Any]:
         client = hazelcast.HazelcastClient(
-            cluster_members=[HAZELCAST_ADDR],
+            cluster_members=[addr.strip() for addr in HAZELCAST_ADDR.split(",") if addr.strip()],
             cluster_name="dev",
             connection_timeout=10.0,
         )
         return client, client.get_queue(COUNTER_QUEUE_NAME).blocking()
 
     hz_client, hz_queue = await loop.run_in_executor(None, init_hazelcast)
-    print(f"Configured fallback logging-service instances: {LOGGING_GRPC_ADDRS}")
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
     global http_client, hz_client, hz_queue
     if http_client:
+        try:
+            await http_client.put(f"{CONSUL_URL}/v1/agent/service/deregister/{SERVICE_ID}", timeout=2.0)
+        except Exception as exc:
+            print(f"failed to deregister facade-service from Consul: {exc}")
         await http_client.aclose()
         http_client = None
     if hz_client:
         hz_client.shutdown()
         hz_client = None
         hz_queue = None
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
 
 
 @app.post("/api/messages")

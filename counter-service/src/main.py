@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import asyncio
+import socket
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -17,8 +18,9 @@ DATABASE_URL = os.getenv(
     "postgresql://counter:counter@localhost:5432/counter",
 )
 STATIC_MESSAGE = os.getenv("STATIC_MESSAGE", "not implemented yet")
-CONFIG_SERVER_URL = os.getenv("CONFIG_SERVER_URL", "http://localhost:7000")
-SERVICE_ADDRESS = os.getenv("SERVICE_ADDRESS", f"localhost:{COUNTER_PORT}")
+CONSUL_URL = os.getenv("CONSUL_URL", "http://localhost:8500")
+SERVICE_HOST = os.getenv("SERVICE_HOST", socket.gethostname())
+SERVICE_ID = os.getenv("SERVICE_ID", f"counter-service-{SERVICE_HOST}-{COUNTER_PORT}")
 HAZELCAST_ADDR = os.getenv("HAZELCAST_ADDR", "localhost:5701")
 COUNTER_QUEUE_NAME = os.getenv("COUNTER_QUEUE_NAME", "counter-transactions")
 
@@ -28,17 +30,35 @@ hz_queue: Any = None
 consumer_task: asyncio.Task[None] | None = None
 
 
+async def consul_get_kv(key: str) -> str:
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{CONSUL_URL}/v1/kv/{key}?raw", timeout=5.0)
+        response.raise_for_status()
+        return response.text.strip()
+
+
 async def register_service() -> None:
     async with httpx.AsyncClient() as client:
         for attempt in range(1, 11):
             try:
-                response = await client.post(
-                    f"{CONFIG_SERVER_URL}/register",
-                    json={"name": "counter-service", "address": f"http://{SERVICE_ADDRESS}"},
+                response = await client.put(
+                    f"{CONSUL_URL}/v1/agent/service/register",
+                    json={
+                        "ID": SERVICE_ID,
+                        "Name": "counter-service",
+                        "Address": SERVICE_HOST,
+                        "Port": COUNTER_PORT,
+                        "Check": {
+                            "HTTP": f"http://{SERVICE_HOST}:{COUNTER_PORT}/health",
+                            "Interval": "5s",
+                            "Timeout": "2s",
+                            "DeregisterCriticalServiceAfter": "30s",
+                        },
+                    },
                     timeout=2.0,
                 )
                 response.raise_for_status()
-                print(f"counter-service registered at config-server as http://{SERVICE_ADDRESS}", flush=True)
+                print(f"counter-service registered in Consul as {SERVICE_HOST}:{COUNTER_PORT}", flush=True)
                 return
             except Exception as exc:
                 print(f"counter-service registration retry {attempt}/10: {exc}", flush=True)
@@ -69,7 +89,17 @@ async def consume_counter_queue() -> None:
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    global db_pool, hz_client, hz_queue, consumer_task
+    global db_pool, hz_client, hz_queue, consumer_task, HAZELCAST_ADDR, COUNTER_QUEUE_NAME
+    for attempt in range(1, 11):
+        try:
+            HAZELCAST_ADDR = await consul_get_kv("config/hazelcast/cluster_members")
+            COUNTER_QUEUE_NAME = await consul_get_kv("config/message_queue/counter_queue_name")
+            break
+        except Exception as exc:
+            if attempt == 10:
+                raise
+            print(f"counter-service waiting for Consul config ({attempt}/10): {exc}", flush=True)
+            await asyncio.sleep(2)
     for attempt in range(1, 11):
         try:
             db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
@@ -92,7 +122,7 @@ async def lifespan(application: FastAPI):
     loop = asyncio.get_event_loop()
     def init_hazelcast() -> tuple[hazelcast.HazelcastClient, Any]:
         client = hazelcast.HazelcastClient(
-            cluster_members=[HAZELCAST_ADDR],
+            cluster_members=[addr.strip() for addr in HAZELCAST_ADDR.split(",") if addr.strip()],
             cluster_name="dev",
             connection_timeout=10.0,
         )
@@ -112,9 +142,19 @@ async def lifespan(application: FastAPI):
         hz_client.shutdown()
     if db_pool:
         await db_pool.close()
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.put(f"{CONSUL_URL}/v1/agent/service/deregister/{SERVICE_ID}", timeout=2.0)
+        except Exception as exc:
+            print(f"counter-service failed to deregister from Consul: {exc}", flush=True)
 
 
 app = FastAPI(title="counter-service", lifespan=lifespan)
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
 
 
 @app.get("/message", response_class=PlainTextResponse)

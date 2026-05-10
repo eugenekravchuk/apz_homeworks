@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import pathlib
+import socket
 import sys
 from typing import Any
 
@@ -21,9 +22,10 @@ import logging_pb2_grpc
 LOGGING_PORT = int(os.getenv("LOGGING_PORT", "4000"))
 LOGGING_GRPC_PORT = int(os.getenv("LOGGING_GRPC_PORT", "50051"))
 HAZELCAST_ADDR = os.getenv("HAZELCAST_ADDR", "localhost:5701")
-SERVICE_INSTANCE = os.getenv("SERVICE_INSTANCE", "logging-1")
-CONFIG_SERVER_URL = os.getenv("CONFIG_SERVER_URL", "http://localhost:7000")
-SERVICE_GRPC_ADDRESS = os.getenv("SERVICE_GRPC_ADDRESS", f"localhost:{LOGGING_GRPC_PORT}")
+CONSUL_URL = os.getenv("CONSUL_URL", "http://localhost:8500")
+SERVICE_HOST = os.getenv("SERVICE_HOST", socket.gethostname())
+SERVICE_INSTANCE = os.getenv("SERVICE_INSTANCE", f"logging-service-{SERVICE_HOST}")
+SERVICE_ID = os.getenv("SERVICE_ID", f"logging-service-{SERVICE_HOST}-{LOGGING_GRPC_PORT}")
 
 app = FastAPI(title="logging-service")
 
@@ -31,17 +33,35 @@ hz_client: hazelcast.HazelcastClient | None = None
 hz_map: Any = None
 
 
+async def consul_get_kv(key: str) -> str:
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{CONSUL_URL}/v1/kv/{key}?raw", timeout=5.0)
+        response.raise_for_status()
+        return response.text.strip()
+
+
 async def register_service() -> None:
     async with httpx.AsyncClient() as client:
         for attempt in range(1, 11):
             try:
-                response = await client.post(
-                    f"{CONFIG_SERVER_URL}/register",
-                    json={"name": "logging-service", "address": SERVICE_GRPC_ADDRESS},
+                response = await client.put(
+                    f"{CONSUL_URL}/v1/agent/service/register",
+                    json={
+                        "ID": SERVICE_ID,
+                        "Name": "logging-service",
+                        "Address": SERVICE_HOST,
+                        "Port": LOGGING_GRPC_PORT,
+                        "Check": {
+                            "TCP": f"{SERVICE_HOST}:{LOGGING_GRPC_PORT}",
+                            "Interval": "5s",
+                            "Timeout": "2s",
+                            "DeregisterCriticalServiceAfter": "30s",
+                        },
+                    },
                     timeout=2.0,
                 )
                 response.raise_for_status()
-                print(f"[{SERVICE_INSTANCE}] registered at config-server as {SERVICE_GRPC_ADDRESS}")
+                print(f"[{SERVICE_INSTANCE}] registered in Consul as {SERVICE_HOST}:{LOGGING_GRPC_PORT}")
                 return
             except Exception as exc:
                 print(f"[{SERVICE_INSTANCE}] registration retry {attempt}/10: {exc}")
@@ -82,13 +102,22 @@ async def start_grpc_server() -> grpc.aio.Server:
 
 @app.on_event("startup")
 async def startup() -> None:
-    global hz_client, hz_map
+    global hz_client, hz_map, HAZELCAST_ADDR
+    for attempt in range(1, 11):
+        try:
+            HAZELCAST_ADDR = await consul_get_kv("config/hazelcast/cluster_members")
+            break
+        except Exception as exc:
+            if attempt == 10:
+                raise
+            print(f"[{SERVICE_INSTANCE}] waiting for Consul config ({attempt}/10): {exc}")
+            await asyncio.sleep(2)
     print(f"[{SERVICE_INSTANCE}] Connecting to Hazelcast at {HAZELCAST_ADDR}...")
     try:
         loop = asyncio.get_event_loop()
         def _init_hz():
             client = hazelcast.HazelcastClient(
-                cluster_members=[HAZELCAST_ADDR],
+                cluster_members=[addr.strip() for addr in HAZELCAST_ADDR.split(",") if addr.strip()],
                 cluster_name="dev",
                 connection_timeout=10.0,
             )
@@ -110,6 +139,11 @@ async def shutdown() -> None:
         await grpc_server.stop(0)
     if hz_client:
         hz_client.shutdown()
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.put(f"{CONSUL_URL}/v1/agent/service/deregister/{SERVICE_ID}", timeout=2.0)
+        except Exception as exc:
+            print(f"[{SERVICE_INSTANCE}] failed to deregister from Consul: {exc}")
 
 
 @app.post("/logs")
